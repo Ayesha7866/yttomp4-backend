@@ -1,0 +1,11 @@
+services:
+  backend:
+    build: .
+    # Put your real values in .env (see .env.example). Never commit .env.
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Keeps finished MP4/MP3 files across restarts.
+      - ./downloads:/app/downloads
+    restart: unless-stopped
