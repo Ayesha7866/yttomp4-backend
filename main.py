@@ -11,6 +11,13 @@ Contract (must match the WordPress plugin YTTOMP4 Converter Engine):
 
 Legal note: only convert videos you have the rights to download/convert,
 and respect YouTube's Terms of Service and applicable copyright law.
+
+Cookies (v1.0.1): YouTube blocks datacenter IPs ("Sign in to confirm
+you're not a bot"). If a cookies.txt file is available, its path is passed
+to yt-dlp via --cookies. Set COOKIES_FILE in Render Environment, or add a
+Render Secret File named cookies.txt (mounted at /etc/secrets/cookies.txt).
+NEVER commit cookies.txt to GitHub — it is a login session. Use a spare
+YouTube account, never your main account.
 """
 import json
 import logging
@@ -54,7 +61,8 @@ MAX_CONCURRENT_JOBS = _get_int("MAX_CONCURRENT_JOBS", 3)
 RATE_LIMIT_CONVERT_PER_MIN = _get_int("RATE_LIMIT_CONVERT_PER_MIN", 30)
 RATE_LIMIT_STATUS_PER_MIN = _get_int("RATE_LIMIT_STATUS_PER_MIN", 120)
 YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
-VERSION = "1.0.0"
+COOKIES_FILE = _get("COOKIES_FILE", "").strip()
+VERSION = "1.0.1"
 
 # ---------------- Converter (yt-dlp + ffmpeg) ----------------
 
@@ -82,6 +90,28 @@ _AUDIO_QUALITY = {"320kbps": "0", "256kbps": "2", "192kbps": "4", "128kbps": "6"
 
 class ConversionError(Exception):
     pass
+
+
+def _cookies_args():
+    """Return yt-dlp --cookies args if a usable cookies.txt exists, else [].
+
+    Priority: COOKIES_FILE env var, then Render Secret File
+    /etc/secrets/cookies.txt, then ./cookies.txt (local testing only).
+    The file must exist and be non-empty; its contents are never logged.
+    """
+    candidates = []
+    if COOKIES_FILE:
+        candidates.append(COOKIES_FILE)
+    candidates.append("/etc/secrets/cookies.txt")
+    candidates.append("cookies.txt")
+    for path in candidates:
+        try:
+            p = Path(path)
+            if p.is_file() and p.stat().st_size > 0:
+                return ["--cookies", str(p)]
+        except OSError:
+            continue
+    return []
 
 
 def extract_video_id(url):
@@ -131,8 +161,8 @@ def _format_duration(seconds):
 
 def fetch_metadata(url):
     result = _run(
-        ["yt-dlp", "--dump-json", "--no-download", "--no-playlist",
-         "--no-warnings", url],
+        ["yt-dlp", *_cookies_args(), "--dump-json", "--no-download",
+         "--no-playlist", "--no-warnings", url],
         timeout=60,
     )
     if result.returncode != 0:
@@ -173,13 +203,14 @@ def convert(url, fmt, quality, job_id):
     download_dir.mkdir(parents=True, exist_ok=True)
     metadata = fetch_metadata(url)
     output_template = str(download_dir / f"{job_id}.%(ext)s")
+    cookie_args = _cookies_args()
     if fmt == "thumbnail":
-        cmd = ["yt-dlp", "--skip-download", "--write-thumbnail",
+        cmd = ["yt-dlp", *cookie_args, "--skip-download", "--write-thumbnail",
                "--convert-thumbnails-to", "jpg",
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
     elif fmt == "mp3":
-        cmd = ["yt-dlp", "-x", "--audio-format", "mp3",
+        cmd = ["yt-dlp", *cookie_args, "-x", "--audio-format", "mp3",
                "--audio-quality", _AUDIO_QUALITY.get(quality, "0"),
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
@@ -190,7 +221,7 @@ def convert(url, fmt, quality, job_id):
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]/best"
         )
-        cmd = ["yt-dlp", "-f", format_selector,
+        cmd = ["yt-dlp", *cookie_args, "-f", format_selector,
                "--merge-output-format", "mp4",
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
