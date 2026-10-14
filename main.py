@@ -1,4 +1,15 @@
-"""YTTOMP4 backend v2.2.0 — ANDROID-CLIENT yt-dlp (FREE, no cookies, no payment).
+"""YTTOMP4 backend v2.3.0 — MULTI-CLIENT yt-dlp + Cobalt 11 fix (FREE, no cookies).
+
+Fixes in v2.3.0 (from v2.2.0 live failure):
+    1. yt-dlp: v2.2.0 Android worked from the dev VM but Render's
+       IPs are flagged harder by YouTube, so the live site still got
+       bot-check. v2.3.0 tries a wider client matrix, including the
+       tv,web_embedded + player_skip=webpage + --force-ipv4 combo
+       reported as most reliable for cloud servers, plus
+       android,ios,mweb,web, then android,ios, android, ios, default.
+    2. Cobalt: v2.2.0 sent downloadMode="video", but Cobalt 11 only
+       accepts downloadMode "auto" | "audio" | "mute" — hence
+       error.api.invalid_body. v2.3.0 sends "auto" for video.
 
 Same plugin contract as v1 (WordPress plugin v1.0.2 works unchanged):
     POST /api/convert  { url, format, quality } -> { job_id, status }
@@ -85,7 +96,7 @@ YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
 COBALT_API_URL = _get("COBALT_API_URL", "https://yttomp4-cobalt.onrender.com").strip().rstrip("/")
 COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
 COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # ---------------- Shared validation ----------------
 
@@ -155,7 +166,7 @@ def _format_duration(seconds):
 def _http_json(method, url, payload=None, timeout=30):
     """Small stdlib JSON client. Returns parsed JSON dict. Raises on error."""
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.2.0"}
+    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.3.0"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -237,7 +248,8 @@ def cobalt_convert(url, fmt, quality):
     payload = {
         "url": url,
         "filenameStyle": "basic",
-        "downloadMode": "audio" if want_audio else "video",
+        # Cobalt 11: downloadMode is "auto" | "audio" | "mute" — "video" is invalid.
+        "downloadMode": "audio" if want_audio else "auto",
     }
     if want_audio:
         payload["audioFormat"] = "mp3"
@@ -254,7 +266,7 @@ def cobalt_convert(url, fmt, quality):
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Api-Key {COBALT_API_KEY}",
-                "User-Agent": "YTTOMP4-Backend/2.2.0",
+                "User-Agent": "YTTOMP4-Backend/2.3.0",
             },
         )
         try:
@@ -317,14 +329,17 @@ def find_output_file(job_id):
     return None
 
 
-def _ytdlp_once(url, fmt, quality, job_id, metadata, player_client):
-    """One yt-dlp attempt with a given player_client (or None = default web)."""
+def _ytdlp_once(url, fmt, quality, job_id, metadata, player_client, extra_args=None):
+    """One yt-dlp attempt with given player_client + extractor args."""
     download_dir = Path(DOWNLOAD_DIR)
     download_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(download_dir / f"{job_id}.%(ext)s")
-    base = ["yt-dlp", "--no-playlist", "--no-warnings"]
+    base = ["yt-dlp", "--no-playlist", "--no-warnings", "--force-ipv4"]
     if player_client:
-        base += ["--extractor-args", f"youtube:player_client={player_client}"]
+        args = f"youtube:player_client={player_client}"
+        if extra_args:
+            args += ";" + extra_args
+        base += ["--extractor-args", args]
     if fmt == "thumbnail":
         cmd = base + ["--skip-download", "--write-thumbnail",
                       "--convert-thumbnails-to", "jpg",
@@ -360,11 +375,20 @@ def _ytdlp_once(url, fmt, quality, job_id, metadata, player_client):
 
 
 def ytdlp_convert(url, fmt, quality, job_id, metadata):
-    """yt-dlp with Android/iOS clients first (bypasses bot-check, no cookies)."""
+    """yt-dlp with a wide client matrix (bypasses bot-check, no cookies)."""
     last_error = ""
-    for client in ("android,ios", "android", "ios", None):
+    # (player_client, extra_extractor_args)
+    attempts = [
+        ("tv,web_embedded", "player_skip=webpage"),
+        ("android,ios,mweb,web", "player_skip=webpage"),
+        ("android,ios", None),
+        ("android", None),
+        ("ios", None),
+        (None, None),
+    ]
+    for client, extra in attempts:
         try:
-            result = _ytdlp_once(url, fmt, quality, job_id, metadata, client)
+            result = _ytdlp_once(url, fmt, quality, job_id, metadata, client, extra)
             logger.info("yt-dlp OK with player_client=%s", client or "default")
             return result
         except ConversionError as exc:
@@ -524,13 +548,13 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": VERSION, "mode": "android-client-ytdlp"}
+    return {"status": "ok", "version": VERSION, "mode": "multi-client-ytdlp"}
 
 
 @app.get("/")
 def root():
     return {"service": "YTTOMP4 Backend", "version": VERSION,
-            "mode": "android-client-ytdlp",
+            "mode": "multi-client-ytdlp",
             "health": "/api/health", "convert": "POST /api/convert",
             "status": "GET /api/status/{job_id}"}
 
