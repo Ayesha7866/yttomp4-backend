@@ -1,15 +1,27 @@
-"""YTTOMP4 backend v2.0.0 — API-FIRST (no daily cookies).
+"""YTTOMP4 backend v2.1.0 — SELF-HOSTED COBALT (no daily cookies).
 
 Same plugin contract as v1 (WordPress plugin v1.0.2 works unchanged):
     POST /api/convert  { url, format, quality } -> { job_id, status }
     GET  /api/status/{job_id} -> { status, download_url, title, ... }
     GET  /api/health (public) -> { status: ok, version }
 
+Why v2.1.0 (what v2.0.0 got wrong):
+    v2.0.0 used the OLD Cobalt v7 API (POST /api/json with
+    isAudioOnly/aFormat). That API was shut down on 11 Nov 2024, so
+    every conversion failed with "cobalt v7 api has been shut down".
+    v2.1.0 uses the CURRENT Cobalt v10 API (POST to the instance base
+    URL with downloadMode/audioFormat) against OUR OWN self-hosted
+    instance. Verified live 2026-10-14: public instances
+    (api.cobalt.tools + 3 others) all return
+    error.api.auth.jwt.missing — they now require auth and cannot be
+    used free. Self-hosted Cobalt has no auth by default.
+
 How it works (no cookies, no daily manual work):
-    1. PRIMARY: Cobalt API (https://api.cobalt.tools) — free public
-       instance, no API key needed. Backend sends the YouTube URL,
-       Cobalt returns a direct download URL (redirect / tunnel / picker).
-       No yt-dlp, no ffmpeg, no cookies for this path.
+    1. PRIMARY: Self-hosted Cobalt v10 (COBALT_API_URL, default
+       https://yttomp4-cobalt.onrender.com). Backend sends the
+       YouTube URL, Cobalt returns a direct download URL
+       (tunnel / redirect / picker). No yt-dlp, no ffmpeg, no
+       cookies for this path.
     2. FALLBACK: local yt-dlp (no cookies). Used only if Cobalt fails.
        This path can still hit YouTube's bot-check on datacenter IPs —
        that is a YouTube-side block, not a bug in this code.
@@ -17,19 +29,16 @@ How it works (no cookies, no daily manual work):
        which needs no key and no cookies.
 
 Honest limits:
-    - Cobalt's public instance is shared and free — it can rate-limit,
-      slow down, or go down. It has no SLA. If it fails AND yt-dlp is
-      bot-blocked, the job fails with a clear error.
-    - For high traffic / guaranteed uptime, self-host Cobalt
-      (https://github.com/imputnet/cobalt) and set COBALT_API_URL to
-      your own instance, or use a paid downloader API.
+    - Self-hosted Cobalt on Render Free sleeps when idle (cold start)
+      and YouTube may still block a datacenter IP. If Cobalt fails
+      AND yt-dlp is bot-blocked, the job fails with a clear error.
     - Cobalt tunnel/redirect URLs are temporary — the visitor should
       download promptly; do not store them for days.
     - Only convert videos you have the rights to download/convert,
       and respect YouTube's Terms of Service and copyright law.
-    - Set COBALT_API_URL to your own Cobalt instance to avoid the
-      shared public instance. Set COBALT_API_KEY only if your instance
-      needs one (public api.cobalt.tools does not).
+    - Set COBALT_API_URL to your own Cobalt instance URL.
+      Set COBALT_API_KEY only if your instance needs one
+      (self-hosted default does not).
 """
 import json
 import logging
@@ -76,10 +85,10 @@ MAX_CONCURRENT_JOBS = _get_int("MAX_CONCURRENT_JOBS", 3)
 RATE_LIMIT_CONVERT_PER_MIN = _get_int("RATE_LIMIT_CONVERT_PER_MIN", 30)
 RATE_LIMIT_STATUS_PER_MIN = _get_int("RATE_LIMIT_STATUS_PER_MIN", 120)
 YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
-COBALT_API_URL = _get("COBALT_API_URL", "https://api.cobalt.tools/api/json").strip()
+COBALT_API_URL = _get("COBALT_API_URL", "https://yttomp4-cobalt.onrender.com").strip().rstrip("/")
 COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
 COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ---------------- Shared validation ----------------
 
@@ -149,7 +158,7 @@ def _format_duration(seconds):
 def _http_json(method, url, payload=None, timeout=30):
     """Small stdlib JSON client. Returns parsed JSON dict. Raises on error."""
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.0.0"}
+    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.1.0"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -220,48 +229,52 @@ def _pick_from_picker(picker, want_audio):
 
 
 def cobalt_convert(url, fmt, quality):
-    """Ask Cobalt for a direct download URL. Raises ConversionError on failure."""
+    """Ask self-hosted Cobalt v10 for a direct download URL.
+
+    v10 API: POST to the instance BASE URL (no /api/json), with
+    downloadMode / audioFormat / videoQuality. Raises ConversionError.
+    """
     if not COBALT_API_URL:
         raise ConversionError("Cobalt API URL is not configured.")
     want_audio = fmt == "mp3"
     payload = {
         "url": url,
         "filenameStyle": "basic",
-        "disableMetadata": True,
+        "downloadMode": "audio" if want_audio else "video",
     }
     if want_audio:
-        payload["isAudioOnly"] = True
-        payload["aFormat"] = "mp3"
+        payload["audioFormat"] = "mp3"
     else:
-        payload["isAudioOnly"] = False
-        payload["vCodec"] = "h264"
-        payload["vQuality"] = _COBALT_QUALITY.get(quality, "720")
-    # Some Cobalt instances accept an API key header; public one does not need it.
-    # _http_json does not send custom auth, so pass the key via env-documented
-    # header here by inlining a dedicated request when a key is set.
+        payload["videoQuality"] = _COBALT_QUALITY.get(quality, "720")
+    # Self-hosted Cobalt needs no key by default. If a key is configured,
+    # send it as Api-Key (Cobalt v10 auth header).
+    endpoint = COBALT_API_URL.rstrip("/") + "/"
     if COBALT_API_KEY:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            COBALT_API_URL, data=data, method="POST",
+            endpoint, data=data, method="POST",
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Api-Key {COBALT_API_KEY}",
-                "User-Agent": "YTTOMP4-Backend/2.0.0",
+                "User-Agent": "YTTOMP4-Backend/2.1.0",
             },
         )
         try:
             with urllib.request.urlopen(req, timeout=COBALT_TIMEOUT_SECONDS) as resp:
                 parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise ConversionError(f"Cobalt failed (Upstream HTTP {exc.code}: {_clean_error(body)})")
         except Exception as exc:
             raise ConversionError(f"Cobalt request failed: {_clean_error(str(exc))}")
         if not isinstance(parsed, dict):
             raise ConversionError("Cobalt returned an unexpected response.")
     else:
-        parsed = _http_json("POST", COBALT_API_URL, payload, timeout=COBALT_TIMEOUT_SECONDS)
+        parsed = _http_json("POST", endpoint, payload, timeout=COBALT_TIMEOUT_SECONDS)
 
     status = str(parsed.get("status") or "").lower()
-    if status in ("redirect", "tunnel"):
+    if status in ("redirect", "tunnel", "stream"):
         direct = str(parsed.get("url") or "")
         if not direct.startswith(("http://", "https://")):
             raise ConversionError("Cobalt returned no download URL.")
@@ -273,7 +286,7 @@ def cobalt_convert(url, fmt, quality):
         raise ConversionError("Cobalt returned no usable download option.")
     if status == "error":
         err = parsed.get("error") or parsed.get("text") or ""
-        # Cobalt error objects are like {"code": "...", "context": {...}}
+        # Cobalt v10 error objects are like {"code": "...", "context": {...}}
         if isinstance(err, dict):
             err = str(err.get("code") or err)
         raise ConversionError(f"Cobalt error: {_clean_error(str(err))}")
@@ -493,13 +506,13 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": VERSION, "mode": "api-first-cobalt"}
+    return {"status": "ok", "version": VERSION, "mode": "self-hosted-cobalt"}
 
 
 @app.get("/")
 def root():
     return {"service": "YTTOMP4 Backend", "version": VERSION,
-            "mode": "api-first-cobalt",
+            "mode": "self-hosted-cobalt",
             "health": "/api/health", "convert": "POST /api/convert",
             "status": "GET /api/status/{job_id}"}
 
