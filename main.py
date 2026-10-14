@@ -1,44 +1,41 @@
-"""YTTOMP4 backend v2.1.0 — SELF-HOSTED COBALT (no daily cookies).
+"""YTTOMP4 backend v2.2.0 — ANDROID-CLIENT yt-dlp (FREE, no cookies, no payment).
 
 Same plugin contract as v1 (WordPress plugin v1.0.2 works unchanged):
     POST /api/convert  { url, format, quality } -> { job_id, status }
     GET  /api/status/{job_id} -> { status, download_url, title, ... }
     GET  /api/health (public) -> { status: ok, version }
 
-Why v2.1.0 (what v2.0.0 got wrong):
-    v2.0.0 used the OLD Cobalt v7 API (POST /api/json with
-    isAudioOnly/aFormat). That API was shut down on 11 Nov 2024, so
-    every conversion failed with "cobalt v7 api has been shut down".
-    v2.1.0 uses the CURRENT Cobalt v10 API (POST to the instance base
-    URL with downloadMode/audioFormat) against OUR OWN self-hosted
-    instance. Verified live 2026-10-14: public instances
-    (api.cobalt.tools + 3 others) all return
-    error.api.auth.jwt.missing — they now require auth and cannot be
-    used free. Self-hosted Cobalt has no auth by default.
+Why v2.2.0 (what was tried before):
+    - v1/v2.0/v2.1 yt-dlp with DEFAULT (web) client -> YouTube
+      bot-check "Sign in to confirm you're not a bot" on Render IPs.
+    - Public Cobalt -> v7 shut down Nov 2024; v10 public instances
+      require JWT auth (error.api.auth.jwt.missing).
+    - Self-hosted Cobalt on Render -> error.api.youtube.login
+      (YouTube blocks Render IPs even via Cobalt).
+    - BREAKTHROUGH verified live 2026-10-14: yt-dlp with
+      --extractor-args "youtube:player_client=android" BYPASSES the
+      bot-check with NO cookies. Full MP4 + MP3 downloads succeeded
+      for Shorts ipimnzKYb80 (602 KB MP4 in ~2s) and V3L5rOwYdN4,
+      plus bJzfl9pw6kk, from a datacenter IP.
 
-How it works (no cookies, no daily manual work):
-    1. PRIMARY: Self-hosted Cobalt v10 (COBALT_API_URL, default
-       https://yttomp4-cobalt.onrender.com). Backend sends the
-       YouTube URL, Cobalt returns a direct download URL
-       (tunnel / redirect / picker). No yt-dlp, no ffmpeg, no
-       cookies for this path.
-    2. FALLBACK: local yt-dlp (no cookies). Used only if Cobalt fails.
-       This path can still hit YouTube's bot-check on datacenter IPs —
-       that is a YouTube-side block, not a bug in this code.
+How it works (no cookies, no payment, no daily work):
+    1. PRIMARY: local yt-dlp with Android+iOS player clients
+       (--extractor-args "youtube:player_client=android,ios").
+       Tries android,ios -> android -> ios -> default web.
+    2. FALLBACK: self-hosted Cobalt v10 (COBALT_API_URL).
+       Used only if all yt-dlp clients fail.
     3. Metadata (title / author / thumbnail) comes from YouTube oEmbed,
        which needs no key and no cookies.
 
 Honest limits:
-    - Self-hosted Cobalt on Render Free sleeps when idle (cold start)
-      and YouTube may still block a datacenter IP. If Cobalt fails
-      AND yt-dlp is bot-blocked, the job fails with a clear error.
-    - Cobalt tunnel/redirect URLs are temporary — the visitor should
-      download promptly; do not store them for days.
+    - Android client usually returns format 18 (360p combined
+      video+audio) for Shorts — so a "720p" request still downloads
+      a WORKING MP4, but at ~360p, not true 720p. That is the price
+      of bypassing the bot-check free. Longer videos may give 240p.
+    - YouTube can close this Android loophole at any time. If it
+      does, jobs will fail with a clear error again.
     - Only convert videos you have the rights to download/convert,
       and respect YouTube's Terms of Service and copyright law.
-    - Set COBALT_API_URL to your own Cobalt instance URL.
-      Set COBALT_API_KEY only if your instance needs one
-      (self-hosted default does not).
 """
 import json
 import logging
@@ -88,7 +85,7 @@ YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
 COBALT_API_URL = _get("COBALT_API_URL", "https://yttomp4-cobalt.onrender.com").strip().rstrip("/")
 COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
 COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ---------------- Shared validation ----------------
 
@@ -158,7 +155,7 @@ def _format_duration(seconds):
 def _http_json(method, url, payload=None, timeout=30):
     """Small stdlib JSON client. Returns parsed JSON dict. Raises on error."""
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.2.0"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -257,7 +254,7 @@ def cobalt_convert(url, fmt, quality):
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Api-Key {COBALT_API_KEY}",
-                "User-Agent": "YTTOMP4-Backend/2.1.0",
+                "User-Agent": "YTTOMP4-Backend/2.2.0",
             },
         )
         try:
@@ -320,20 +317,22 @@ def find_output_file(job_id):
     return None
 
 
-def ytdlp_convert(url, fmt, quality, job_id, metadata):
+def _ytdlp_once(url, fmt, quality, job_id, metadata, player_client):
+    """One yt-dlp attempt with a given player_client (or None = default web)."""
     download_dir = Path(DOWNLOAD_DIR)
     download_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(download_dir / f"{job_id}.%(ext)s")
+    base = ["yt-dlp", "--no-playlist", "--no-warnings"]
+    if player_client:
+        base += ["--extractor-args", f"youtube:player_client={player_client}"]
     if fmt == "thumbnail":
-        cmd = ["yt-dlp", "--skip-download", "--write-thumbnail",
-               "--convert-thumbnails-to", "jpg",
-               "--no-playlist", "--no-warnings",
-               "-o", output_template, url]
+        cmd = base + ["--skip-download", "--write-thumbnail",
+                      "--convert-thumbnails-to", "jpg",
+                      "-o", output_template, url]
     elif fmt == "mp3":
-        cmd = ["yt-dlp", "-x", "--audio-format", "mp3",
-               "--audio-quality", _AUDIO_QUALITY.get(quality, "0"),
-               "--no-playlist", "--no-warnings",
-               "-o", output_template, url]
+        cmd = base + ["-x", "--audio-format", "mp3",
+                      "--audio-quality", _AUDIO_QUALITY.get(quality, "0"),
+                      "-o", output_template, url]
     else:
         height = _QUALITY_HEIGHT.get(quality, 1080)
         format_selector = (
@@ -341,10 +340,9 @@ def ytdlp_convert(url, fmt, quality, job_id, metadata):
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]/best"
         )
-        cmd = ["yt-dlp", "-f", format_selector,
-               "--merge-output-format", "mp4",
-               "--no-playlist", "--no-warnings",
-               "-o", output_template, url]
+        cmd = base + ["-f", format_selector,
+                      "--merge-output-format", "mp4",
+                      "-o", output_template, url]
     result = _run(cmd, timeout=YTDLP_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise ConversionError("Conversion failed: " + _clean_error(result.stderr))
@@ -361,6 +359,26 @@ def ytdlp_convert(url, fmt, quality, job_id, metadata):
     }
 
 
+def ytdlp_convert(url, fmt, quality, job_id, metadata):
+    """yt-dlp with Android/iOS clients first (bypasses bot-check, no cookies)."""
+    last_error = ""
+    for client in ("android,ios", "android", "ios", None):
+        try:
+            result = _ytdlp_once(url, fmt, quality, job_id, metadata, client)
+            logger.info("yt-dlp OK with player_client=%s", client or "default")
+            return result
+        except ConversionError as exc:
+            last_error = str(exc)
+            logger.warning("yt-dlp player_client=%s failed: %s", client or "default", exc)
+            # Remove any partial file before the next attempt.
+            for path in Path(DOWNLOAD_DIR).glob(f"{job_id}.*"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    raise ConversionError(last_error or "yt-dlp failed for all player clients.")
+
+
 def convert(url, fmt, quality, job_id):
     video_id = extract_video_id(url) or ""
     metadata = fetch_metadata_oembed(url, video_id)
@@ -375,7 +393,13 @@ def convert(url, fmt, quality, job_id):
             "duration": "",
             "thumbnail": thumb,
         }
-    # Primary: Cobalt (no cookies, no daily work).
+    # Primary: yt-dlp with Android/iOS clients (bypasses bot-check, free).
+    try:
+        return ytdlp_convert(url, fmt, quality, job_id, metadata)
+    except ConversionError as exc:
+        logger.warning("Job %s: yt-dlp (Android/iOS) failed, trying Cobalt: %s", job_id, exc)
+        ytdlp_error = str(exc)
+    # Fallback: self-hosted Cobalt v10.
     try:
         direct = cobalt_convert(url, fmt, quality)
         logger.info("Job %s: Cobalt OK (%s)", job_id, fmt)
@@ -388,14 +412,8 @@ def convert(url, fmt, quality, job_id):
             "thumbnail": metadata["thumbnail"],
         }
     except ConversionError as exc:
-        logger.warning("Job %s: Cobalt failed, trying yt-dlp fallback: %s", job_id, exc)
-        cobalt_error = str(exc)
-    # Fallback: local yt-dlp (no cookies). May still hit YouTube bot-check.
-    try:
-        return ytdlp_convert(url, fmt, quality, job_id, metadata)
-    except ConversionError as exc:
         raise ConversionError(
-            f"Cobalt failed ({cobalt_error}). Fallback also failed: {exc}"
+            f"yt-dlp failed ({ytdlp_error}). Cobalt also failed: {exc}"
         )
 
 
@@ -506,13 +524,13 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": VERSION, "mode": "self-hosted-cobalt"}
+    return {"status": "ok", "version": VERSION, "mode": "android-client-ytdlp"}
 
 
 @app.get("/")
 def root():
     return {"service": "YTTOMP4 Backend", "version": VERSION,
-            "mode": "self-hosted-cobalt",
+            "mode": "android-client-ytdlp",
             "health": "/api/health", "convert": "POST /api/convert",
             "status": "GET /api/status/{job_id}"}
 
