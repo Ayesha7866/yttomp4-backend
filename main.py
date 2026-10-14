@@ -1,23 +1,35 @@
-"""YTTOMP4 backend — FLAT version (no folders, no coding knowledge needed).
+"""YTTOMP4 backend v2.0.0 — API-FIRST (no daily cookies).
 
-Everything lives in this ONE file: settings + converter + API.
-Upload this file + Dockerfile + requirements.txt to GitHub (all at root)
-and Render will deploy it.
-
-Contract (must match the WordPress plugin YTTOMP4 Converter Engine):
+Same plugin contract as v1 (WordPress plugin v1.0.2 works unchanged):
     POST /api/convert  { url, format, quality } -> { job_id, status }
     GET  /api/status/{job_id} -> { status, download_url, title, ... }
-    GET  /api/health (public) -> { status: ok }
+    GET  /api/health (public) -> { status: ok, version }
 
-Legal note: only convert videos you have the rights to download/convert,
-and respect YouTube's Terms of Service and applicable copyright law.
+How it works (no cookies, no daily manual work):
+    1. PRIMARY: Cobalt API (https://api.cobalt.tools) — free public
+       instance, no API key needed. Backend sends the YouTube URL,
+       Cobalt returns a direct download URL (redirect / tunnel / picker).
+       No yt-dlp, no ffmpeg, no cookies for this path.
+    2. FALLBACK: local yt-dlp (no cookies). Used only if Cobalt fails.
+       This path can still hit YouTube's bot-check on datacenter IPs —
+       that is a YouTube-side block, not a bug in this code.
+    3. Metadata (title / author / thumbnail) comes from YouTube oEmbed,
+       which needs no key and no cookies.
 
-Cookies (v1.0.1): YouTube blocks datacenter IPs ("Sign in to confirm
-you're not a bot"). If a cookies.txt file is available, its path is passed
-to yt-dlp via --cookies. Set COOKIES_FILE in Render Environment, or add a
-Render Secret File named cookies.txt (mounted at /etc/secrets/cookies.txt).
-NEVER commit cookies.txt to GitHub — it is a login session. Use a spare
-YouTube account, never your main account.
+Honest limits:
+    - Cobalt's public instance is shared and free — it can rate-limit,
+      slow down, or go down. It has no SLA. If it fails AND yt-dlp is
+      bot-blocked, the job fails with a clear error.
+    - For high traffic / guaranteed uptime, self-host Cobalt
+      (https://github.com/imputnet/cobalt) and set COBALT_API_URL to
+      your own instance, or use a paid downloader API.
+    - Cobalt tunnel/redirect URLs are temporary — the visitor should
+      download promptly; do not store them for days.
+    - Only convert videos you have the rights to download/convert,
+      and respect YouTube's Terms of Service and copyright law.
+    - Set COBALT_API_URL to your own Cobalt instance to avoid the
+      shared public instance. Set COBALT_API_KEY only if your instance
+      needs one (public api.cobalt.tools does not).
 """
 import json
 import logging
@@ -26,6 +38,9 @@ import re
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -61,10 +76,12 @@ MAX_CONCURRENT_JOBS = _get_int("MAX_CONCURRENT_JOBS", 3)
 RATE_LIMIT_CONVERT_PER_MIN = _get_int("RATE_LIMIT_CONVERT_PER_MIN", 30)
 RATE_LIMIT_STATUS_PER_MIN = _get_int("RATE_LIMIT_STATUS_PER_MIN", 120)
 YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
-COOKIES_FILE = _get("COOKIES_FILE", "").strip()
-VERSION = "1.0.1"
+COBALT_API_URL = _get("COBALT_API_URL", "https://api.cobalt.tools/api/json").strip()
+COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
+COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
+VERSION = "2.0.0"
 
-# ---------------- Converter (yt-dlp + ffmpeg) ----------------
+# ---------------- Shared validation ----------------
 
 ALLOWED_FORMATS = {"mp4", "mp3", "shorts", "thumbnail"}
 ALLOWED_QUALITIES = {
@@ -86,32 +103,14 @@ _QUALITY_HEIGHT = {
     "480p": 480, "360p": 360, "240p": 240, "144p": 144,
 }
 _AUDIO_QUALITY = {"320kbps": "0", "256kbps": "2", "192kbps": "4", "128kbps": "6"}
+_COBALT_QUALITY = {
+    "2160p": "2160", "1440p": "1440", "1080p": "1080", "720p": "720",
+    "480p": "480", "360p": "360", "240p": "240", "144p": "144",
+}
 
 
 class ConversionError(Exception):
     pass
-
-
-def _cookies_args():
-    """Return yt-dlp --cookies args if a usable cookies.txt exists, else [].
-
-    Priority: COOKIES_FILE env var, then Render Secret File
-    /etc/secrets/cookies.txt, then ./cookies.txt (local testing only).
-    The file must exist and be non-empty; its contents are never logged.
-    """
-    candidates = []
-    if COOKIES_FILE:
-        candidates.append(COOKIES_FILE)
-    candidates.append("/etc/secrets/cookies.txt")
-    candidates.append("cookies.txt")
-    for path in candidates:
-        try:
-            p = Path(path)
-            if p.is_file() and p.stat().st_size > 0:
-                return ["--cookies", str(p)]
-        except OSError:
-            continue
-    return []
 
 
 def extract_video_id(url):
@@ -125,18 +124,6 @@ def extract_video_id(url):
         return None
     match = _VIDEO_ID_RE.search(url)
     return match.group(1) if match else None
-
-
-def _run(cmd, timeout):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        raise ConversionError(
-            "yt-dlp is not installed on this server. "
-            "Install it (pip install yt-dlp) and restart the backend."
-        )
-    except subprocess.TimeoutExpired:
-        raise ConversionError("Conversion timed out. Try a shorter video.")
 
 
 def _clean_error(text):
@@ -159,30 +146,152 @@ def _format_duration(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
-def fetch_metadata(url):
-    result = _run(
-        ["yt-dlp", *_cookies_args(), "--dump-json", "--no-download",
-         "--no-playlist", "--no-warnings", url],
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise ConversionError("Could not read this video: " + _clean_error(result.stderr))
+def _http_json(method, url, payload=None, timeout=30):
+    """Small stdlib JSON client. Returns parsed JSON dict. Raises on error."""
+    data = None
+    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.0.0"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        data = json.loads(result.stdout)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ConversionError(f"Upstream HTTP {exc.code}: {_clean_error(body)}")
+    except urllib.error.URLError as exc:
+        raise ConversionError(f"Could not reach upstream service: {_clean_error(str(exc.reason or exc))}")
+    except TimeoutError:
+        raise ConversionError("Upstream service timed out. Please try again.")
+    try:
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        raise ConversionError("Could not read this video's information.")
-    duration = data.get("duration") or 0
-    if duration and duration > MAX_DURATION_SECONDS:
-        raise ConversionError(
-            f"Video is too long ({int(duration // 60)} min). "
-            f"Maximum allowed is {MAX_DURATION_SECONDS // 60} minutes."
+        raise ConversionError("Upstream service returned an unexpected response.")
+    if not isinstance(parsed, dict):
+        raise ConversionError("Upstream service returned an unexpected response.")
+    return parsed
+
+
+def fetch_metadata_oembed(url, video_id):
+    """Title/author/thumbnail via YouTube oEmbed — no key, no cookies."""
+    thumb = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
+    try:
+        oembed_url = (
+            "https://www.youtube.com/oembed?url="
+            + urllib.parse.quote(url, safe="")
+            + "&format=json"
         )
-    return {
-        "title": (data.get("title") or "")[:255],
-        "author": (data.get("uploader") or data.get("channel") or "")[:255],
-        "duration": _format_duration(duration),
-        "thumbnail": data.get("thumbnail") or "",
+        data = _http_json("GET", oembed_url, timeout=15)
+        return {
+            "title": (str(data.get("title") or "")[:255]),
+            "author": (str(data.get("author_name") or "")[:255]),
+            "duration": "",
+            "thumbnail": (str(data.get("thumbnail_url") or "") or thumb),
+        }
+    except ConversionError:
+        return {"title": "", "author": "", "duration": "", "thumbnail": thumb}
+    except Exception:
+        return {"title": "", "author": "", "duration": "", "thumbnail": thumb}
+
+
+# ---------------- Cobalt (primary, no cookies) ----------------
+
+def _pick_from_picker(picker, want_audio):
+    """Pick the best URL from a Cobalt picker list."""
+    if not isinstance(picker, list):
+        return ""
+    # Prefer matching type, else first item with a URL.
+    for item in picker:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        typ = str(item.get("type") or "").lower()
+        if not url:
+            continue
+        if want_audio and "audio" in typ:
+            return url
+        if (not want_audio) and "video" in typ:
+            return url
+    for item in picker:
+        if isinstance(item, dict) and item.get("url"):
+            return str(item["url"])
+    return ""
+
+
+def cobalt_convert(url, fmt, quality):
+    """Ask Cobalt for a direct download URL. Raises ConversionError on failure."""
+    if not COBALT_API_URL:
+        raise ConversionError("Cobalt API URL is not configured.")
+    want_audio = fmt == "mp3"
+    payload = {
+        "url": url,
+        "filenameStyle": "basic",
+        "disableMetadata": True,
     }
+    if want_audio:
+        payload["isAudioOnly"] = True
+        payload["aFormat"] = "mp3"
+    else:
+        payload["isAudioOnly"] = False
+        payload["vCodec"] = "h264"
+        payload["vQuality"] = _COBALT_QUALITY.get(quality, "720")
+    # Some Cobalt instances accept an API key header; public one does not need it.
+    # _http_json does not send custom auth, so pass the key via env-documented
+    # header here by inlining a dedicated request when a key is set.
+    if COBALT_API_KEY:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            COBALT_API_URL, data=data, method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {COBALT_API_KEY}",
+                "User-Agent": "YTTOMP4-Backend/2.0.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=COBALT_TIMEOUT_SECONDS) as resp:
+                parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise ConversionError(f"Cobalt request failed: {_clean_error(str(exc))}")
+        if not isinstance(parsed, dict):
+            raise ConversionError("Cobalt returned an unexpected response.")
+    else:
+        parsed = _http_json("POST", COBALT_API_URL, payload, timeout=COBALT_TIMEOUT_SECONDS)
+
+    status = str(parsed.get("status") or "").lower()
+    if status in ("redirect", "tunnel"):
+        direct = str(parsed.get("url") or "")
+        if not direct.startswith(("http://", "https://")):
+            raise ConversionError("Cobalt returned no download URL.")
+        return direct
+    if status == "picker":
+        direct = _pick_from_picker(parsed.get("picker"), want_audio)
+        if direct.startswith(("http://", "https://")):
+            return direct
+        raise ConversionError("Cobalt returned no usable download option.")
+    if status == "error":
+        err = parsed.get("error") or parsed.get("text") or ""
+        # Cobalt error objects are like {"code": "...", "context": {...}}
+        if isinstance(err, dict):
+            err = str(err.get("code") or err)
+        raise ConversionError(f"Cobalt error: {_clean_error(str(err))}")
+    raise ConversionError(f"Cobalt returned unexpected status: {_clean_error(status)}")
+
+
+# ---------------- yt-dlp fallback (no cookies) ----------------
+
+def _run(cmd, timeout):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise ConversionError(
+            "yt-dlp is not installed on this server. "
+            "Install it (pip install yt-dlp) and restart the backend."
+        )
+    except subprocess.TimeoutExpired:
+        raise ConversionError("Conversion timed out. Try a shorter video.")
 
 
 def find_output_file(job_id):
@@ -198,19 +307,17 @@ def find_output_file(job_id):
     return None
 
 
-def convert(url, fmt, quality, job_id):
+def ytdlp_convert(url, fmt, quality, job_id, metadata):
     download_dir = Path(DOWNLOAD_DIR)
     download_dir.mkdir(parents=True, exist_ok=True)
-    metadata = fetch_metadata(url)
     output_template = str(download_dir / f"{job_id}.%(ext)s")
-    cookie_args = _cookies_args()
     if fmt == "thumbnail":
-        cmd = ["yt-dlp", *cookie_args, "--skip-download", "--write-thumbnail",
+        cmd = ["yt-dlp", "--skip-download", "--write-thumbnail",
                "--convert-thumbnails-to", "jpg",
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
     elif fmt == "mp3":
-        cmd = ["yt-dlp", *cookie_args, "-x", "--audio-format", "mp3",
+        cmd = ["yt-dlp", "-x", "--audio-format", "mp3",
                "--audio-quality", _AUDIO_QUALITY.get(quality, "0"),
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
@@ -221,7 +328,7 @@ def convert(url, fmt, quality, job_id):
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]/best"
         )
-        cmd = ["yt-dlp", *cookie_args, "-f", format_selector,
+        cmd = ["yt-dlp", "-f", format_selector,
                "--merge-output-format", "mp4",
                "--no-playlist", "--no-warnings",
                "-o", output_template, url]
@@ -233,11 +340,50 @@ def convert(url, fmt, quality, job_id):
         raise ConversionError("Conversion finished but no file was produced.")
     return {
         "filename": output.name,
+        "download_url": f"{PUBLIC_BASE_URL}/files/{output.name}",
         "title": metadata["title"],
         "author": metadata["author"],
         "duration": metadata["duration"],
         "thumbnail": metadata["thumbnail"],
     }
+
+
+def convert(url, fmt, quality, job_id):
+    video_id = extract_video_id(url) or ""
+    metadata = fetch_metadata_oembed(url, video_id)
+    # Thumbnail: no conversion needed — return the thumbnail URL directly.
+    if fmt == "thumbnail":
+        thumb = metadata["thumbnail"] or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        return {
+            "filename": "",
+            "download_url": thumb,
+            "title": metadata["title"],
+            "author": metadata["author"],
+            "duration": "",
+            "thumbnail": thumb,
+        }
+    # Primary: Cobalt (no cookies, no daily work).
+    try:
+        direct = cobalt_convert(url, fmt, quality)
+        logger.info("Job %s: Cobalt OK (%s)", job_id, fmt)
+        return {
+            "filename": "",
+            "download_url": direct,
+            "title": metadata["title"],
+            "author": metadata["author"],
+            "duration": metadata["duration"],
+            "thumbnail": metadata["thumbnail"],
+        }
+    except ConversionError as exc:
+        logger.warning("Job %s: Cobalt failed, trying yt-dlp fallback: %s", job_id, exc)
+        cobalt_error = str(exc)
+    # Fallback: local yt-dlp (no cookies). May still hit YouTube bot-check.
+    try:
+        return ytdlp_convert(url, fmt, quality, job_id, metadata)
+    except ConversionError as exc:
+        raise ConversionError(
+            f"Cobalt failed ({cobalt_error}). Fallback also failed: {exc}"
+        )
 
 
 # ---------------- API ----------------
@@ -296,13 +442,12 @@ def _run_job(job_id):
         return
     try:
         result = convert(job["url"], job["format"], job["quality"], job_id)
-        download_url = f"{PUBLIC_BASE_URL}/files/{result['filename']}"
         with jobs_lock:
             job.update({"status": "completed", "title": result["title"],
                         "author": result["author"], "duration": result["duration"],
-                        "thumbnail": result["thumbnail"], "filename": result["filename"],
-                        "download_url": download_url})
-        logger.info("Job %s completed: %s", job_id, result["filename"])
+                        "thumbnail": result["thumbnail"], "filename": result.get("filename", ""),
+                        "download_url": result["download_url"]})
+        logger.info("Job %s completed", job_id)
     except ConversionError as exc:
         with jobs_lock:
             job["status"] = "failed"
@@ -348,12 +493,13 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": VERSION}
+    return {"status": "ok", "version": VERSION, "mode": "api-first-cobalt"}
 
 
 @app.get("/")
 def root():
     return {"service": "YTTOMP4 Backend", "version": VERSION,
+            "mode": "api-first-cobalt",
             "health": "/api/health", "convert": "POST /api/convert",
             "status": "GET /api/status/{job_id}"}
 
