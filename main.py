@@ -1,15 +1,34 @@
-"""YTTOMP4 backend v2.3.0 — MULTI-CLIENT yt-dlp + Cobalt 11 fix (FREE, no cookies).
+"""YTTOMP4 backend v2.4.0 — INVIDIOUS DIRECT-LINK (FREE, no cookies).
 
-Fixes in v2.3.0 (from v2.2.0 live failure):
-    1. yt-dlp: v2.2.0 Android worked from the dev VM but Render's
-       IPs are flagged harder by YouTube, so the live site still got
-       bot-check. v2.3.0 tries a wider client matrix, including the
-       tv,web_embedded + player_skip=webpage + --force-ipv4 combo
-       reported as most reliable for cloud servers, plus
-       android,ios,mweb,web, then android,ios, android, ios, default.
-    2. Cobalt: v2.2.0 sent downloadMode="video", but Cobalt 11 only
-       accepts downloadMode "auto" | "audio" | "mute" — hence
-       error.api.invalid_body. v2.3.0 sends "auto" for video.
+Why v2.4.0: v2.3.0 proved Render's IP is blocked for EVERY
+server-side extraction path (all 6 yt-dlp clients + self-hosted
+Cobalt all get YouTube bot-check / login errors from Render IPs).
+v2.4.0 stops trying to download on the server. Instead it asks a
+public Invidious instance for the video's stream URLs and returns
+the direct Google CDN (googlevideo) URL. The VISITOR's browser then
+downloads straight from Google — from the visitor's own residential
+/ mobile IP, which YouTube does not block. The server never touches
+the video bytes, so the server IP block no longer matters.
+
+Verified 2026-10-15: invidious.f5.si /api/v1/videos/wEZKcOFVs8w
+returned real metadata + 1 progressive MP4 formatStream (360p) +
+23 adaptive formats. Google's redirect for the stream URL carries
+ipbypass=yes (Google serves it regardless of client IP) — but that
+was NOT provable from the dev VM (its egress proxy blocks video
+streams), so the live visitor-browser test is the decisive one.
+
+Honest limits:
+    - Video is ~360p (itag 18 progressive), NOT the requested 720p/
+      1080p — progressive streams above 360p are not offered. The
+      returned downloads[] row reports the ACTUAL quality (360p).
+    - Audio is M4A (itag 140, ~128kbps), NOT MP3 — the browser gets
+      an .m4a file. downloads[] reports format M4A honestly.
+    - Single Invidious instance dependency: only invidious.f5.si
+      currently exposes a public API (api=true, cors=true) in the
+      official instances list. If it goes down, jobs fall back to
+      yt-dlp / Cobalt (which fail on Render) and fail honestly.
+    - googlevideo URLs expire (a few hours) — each Convert mints a
+      fresh one, so this is fine for on-demand downloads.
 
 Same plugin contract as v1 (WordPress plugin v1.0.2 works unchanged):
     POST /api/convert  { url, format, quality } -> { job_id, status }
@@ -96,7 +115,7 @@ YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
 COBALT_API_URL = _get("COBALT_API_URL", "https://yttomp4-cobalt.onrender.com").strip().rstrip("/")
 COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
 COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # ---------------- Shared validation ----------------
 
@@ -166,7 +185,7 @@ def _format_duration(seconds):
 def _http_json(method, url, payload=None, timeout=30):
     """Small stdlib JSON client. Returns parsed JSON dict. Raises on error."""
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.3.0"}
+    headers = {"Accept": "application/json", "User-Agent": "YTTOMP4-Backend/2.4.0"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -266,7 +285,7 @@ def cobalt_convert(url, fmt, quality):
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Api-Key {COBALT_API_KEY}",
-                "User-Agent": "YTTOMP4-Backend/2.3.0",
+                "User-Agent": "YTTOMP4-Backend/2.4.0",
             },
         )
         try:
@@ -403,6 +422,122 @@ def ytdlp_convert(url, fmt, quality, job_id, metadata):
     raise ConversionError(last_error or "yt-dlp failed for all player clients.")
 
 
+# Invidious instances that expose a public API. Verified 2026-10-15:
+# invidious.f5.si is the ONLY instance in the official list with
+# api=true + cors=true (nadeko etc. have the API disabled).
+INVIDIOUS_INSTANCES = ["https://invidious.f5.si"]
+INVIDIOUS_TIMEOUT_SECONDS = 20
+
+
+def _quality_sort_key(entry):
+    """Sort video streams best-first by height parsed from size 'WxH'."""
+    try:
+        height = int(str(entry.get("size", "")).split("x")[1])
+    except (IndexError, ValueError):
+        height = 0
+    return height
+
+
+def invidious_convert(url, fmt, quality, job_id, metadata):
+    """Direct-link via Invidious: return a googlevideo URL for the
+    visitor's browser to download. The server downloads nothing.
+    Raises ConversionError when Invidious has no usable stream."""
+    video_id = extract_video_id(url) or ""
+    if not video_id:
+        raise ConversionError("Invidious: could not extract video ID.")
+    last_error = ""
+    for base in INVIDIOUS_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"{base}/api/v1/videos/{video_id}",
+                headers={"Accept": "application/json",
+                         "User-Agent": "YTTOMP4-Backend/2.4.0"},
+            )
+            with urllib.request.urlopen(req, timeout=INVIDIOUS_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001 - any fetch/parse failure
+            last_error = f"{base}: {exc}"
+            logger.warning("Job %s: Invidious %s failed: %s", job_id, base, exc)
+            continue
+        if isinstance(data, dict) and data.get("error"):
+            last_error = f"{base}: {data.get('error')}"
+            continue
+        title = (data.get("title") or metadata["title"] or "").strip()
+        author = (data.get("author") or metadata["author"] or "").strip()
+        duration = ""
+        try:
+            length = int(data.get("lengthSeconds") or 0)
+            if length:
+                duration = f"{length // 60:02d}:{length % 60:02d}"
+        except (TypeError, ValueError):
+            pass
+        thumbnail = metadata["thumbnail"] or ""
+        for thumb in data.get("videoThumbnails") or []:
+            if thumb.get("quality") in ("maxres", "maxresdefault"):
+                thumbnail = thumb.get("url") or thumbnail
+                break
+        if fmt == "mp3":
+            # Best audio-only adaptive format; prefer M4A (itag 140).
+            audios = [a for a in (data.get("adaptiveFormats") or [])
+                      if (a.get("type") or "").startswith("audio/")
+                      and a.get("url")]
+            if not audios:
+                last_error = f"{base}: no audio streams"
+                continue
+            audios.sort(key=lambda a: (
+                0 if "audio/mp4" in (a.get("type") or "") else 1,
+                -(int(a.get("bitrate") or 0)),
+            ))
+            best = audios[0]
+            kbps = int(best.get("bitrate") or 0) // 1000
+            logger.info("Job %s: Invidious OK (audio %s)", job_id,
+                        best.get("type"))
+            return {
+                "filename": "",
+                "download_url": best["url"],
+                "title": title,
+                "author": author,
+                "duration": duration or metadata["duration"],
+                "thumbnail": thumbnail,
+                "actual_format": "M4A",
+                "actual_quality": f"{kbps}kbps" if kbps else "Audio",
+            }
+        # Video: best progressive (video+audio) formatStream.
+        streams = [s for s in (data.get("formatStreams") or [])
+                   if s.get("url")]
+        if not streams:
+            last_error = f"{base}: no progressive video streams"
+            continue
+        streams.sort(key=_quality_sort_key, reverse=True)
+        best = streams[0]
+        # Label by itag (18 -> 360p even for vertical Shorts, whose
+        # size reads 360x640). Fall back to the height if itag unknown.
+        itag_quality = {17: "144p", 36: "240p", 34: "360p", 43: "360p",
+                        18: "360p", 35: "480p", 22: "720p"}
+        try:
+            label = itag_quality.get(int(best.get("itag") or 0), "")
+        except (TypeError, ValueError):
+            label = ""
+        if not label:
+            try:
+                label = f"{int(str(best.get('size', '')).split('x')[1])}p"
+            except (IndexError, ValueError):
+                label = "Video"
+        logger.info("Job %s: Invidious OK (video %s)", job_id,
+                    best.get("size"))
+        return {
+            "filename": "",
+            "download_url": best["url"],
+            "title": title,
+            "author": author,
+            "duration": duration or metadata["duration"],
+            "thumbnail": thumbnail,
+            "actual_format": "MP4",
+            "actual_quality": label,
+        }
+    raise ConversionError(f"Invidious failed: {last_error or 'no streams'}")
+
+
 def convert(url, fmt, quality, job_id):
     video_id = extract_video_id(url) or ""
     metadata = fetch_metadata_oembed(url, video_id)
@@ -417,13 +552,21 @@ def convert(url, fmt, quality, job_id):
             "duration": "",
             "thumbnail": thumb,
         }
-    # Primary: yt-dlp with Android/iOS clients (bypasses bot-check, free).
+    # PRIMARY (v2.4.0): Invidious direct-link. The visitor's browser
+    # downloads from Google's CDN on its own IP, so the server IP block
+    # no longer matters. Fast (~2s) when the instance is up.
+    try:
+        return invidious_convert(url, fmt, quality, job_id, metadata)
+    except ConversionError as exc:
+        logger.warning("Job %s: Invidious failed, trying yt-dlp: %s", job_id, exc)
+        invidious_error = str(exc)
+    # Fallback 1: yt-dlp with multi-client matrix (works on unblocked hosts).
     try:
         return ytdlp_convert(url, fmt, quality, job_id, metadata)
     except ConversionError as exc:
-        logger.warning("Job %s: yt-dlp (Android/iOS) failed, trying Cobalt: %s", job_id, exc)
+        logger.warning("Job %s: yt-dlp failed, trying Cobalt: %s", job_id, exc)
         ytdlp_error = str(exc)
-    # Fallback: self-hosted Cobalt v10.
+    # Fallback 2: self-hosted Cobalt.
     try:
         direct = cobalt_convert(url, fmt, quality)
         logger.info("Job %s: Cobalt OK (%s)", job_id, fmt)
@@ -437,6 +580,7 @@ def convert(url, fmt, quality, job_id):
         }
     except ConversionError as exc:
         raise ConversionError(
+            f"Invidious failed ({invidious_error}). "
             f"yt-dlp failed ({ytdlp_error}). Cobalt also failed: {exc}"
         )
 
@@ -501,7 +645,9 @@ def _run_job(job_id):
             job.update({"status": "completed", "title": result["title"],
                         "author": result["author"], "duration": result["duration"],
                         "thumbnail": result["thumbnail"], "filename": result.get("filename", ""),
-                        "download_url": result["download_url"]})
+                        "download_url": result["download_url"],
+                        "actual_format": result.get("actual_format", ""),
+                        "actual_quality": result.get("actual_quality", "")})
         logger.info("Job %s completed", job_id)
     except ConversionError as exc:
         with jobs_lock:
@@ -548,13 +694,13 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": VERSION, "mode": "multi-client-ytdlp"}
+    return {"status": "ok", "version": VERSION, "mode": "invidious-direct"}
 
 
 @app.get("/")
 def root():
     return {"service": "YTTOMP4 Backend", "version": VERSION,
-            "mode": "multi-client-ytdlp",
+            "mode": "invidious-direct",
             "health": "/api/health", "convert": "POST /api/convert",
             "status": "GET /api/status/{job_id}"}
 
@@ -577,6 +723,7 @@ def start_conversion(body: ConvertRequest, request: Request, _auth: None = Depen
                         "format": fmt, "quality": quality, "video_id": video_id,
                         "title": "", "author": "", "duration": "", "thumbnail": "",
                         "filename": "", "download_url": "", "error": "",
+                        "actual_format": "", "actual_quality": "",
                         "created_at": time.time()}
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
     return {"job_id": job_id, "status": "processing"}
@@ -592,10 +739,13 @@ def get_status(job_id: str, request: Request, _auth: None = Depends(_require_api
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] == "completed":
+        # Report the ACTUAL stream quality/format (Invidious: 360p / M4A),
+        # not the requested one, so the download table tells the truth.
         return {"status": "completed", "download_url": job["download_url"],
                 "title": job["title"], "author": job["author"],
                 "duration": job["duration"], "thumbnail": job["thumbnail"],
-                "downloads": [{"quality": job["quality"], "format": job["format"].upper(),
+                "downloads": [{"quality": job.get("actual_quality") or job["quality"],
+                              "format": job.get("actual_format") or job["format"].upper(),
                               "size": "", "url": job["download_url"]}]}
     if job["status"] == "failed":
         return {"status": "failed", "error": job["error"] or "Conversion failed."}
