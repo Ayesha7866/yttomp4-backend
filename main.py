@@ -1,4 +1,14 @@
-"""YTTOMP4 backend v2.4.0 — INVIDIOUS DIRECT-LINK (FREE, no cookies).
+"""YTTOMP4 backend v2.4.1 — INVIDIOUS DIRECT-LINK + FAIL FAST (FREE, no cookies).
+
+v2.4.1 fix: when Invidious fails (e.g. per-video HTTP 500 from its
+companion), v2.4.0 burned ~90s on yt-dlp/Cobalt fallbacks that ALWAYS
+fail on Render, and the long request got killed into an HTML error
+page, producing the frontend's "Unexpected token '<'" JSON error.
+v2.4.1 fails fast with the Invidious error (clean JSON) unless
+ENABLE_SLOW_FALLBACKS=1 is set (only for hosts YouTube doesn't block).
+Bridge wait also dropped 60s -> 30s in plugin v1.0.4 as a safety net.
+
+v2.4.0 — INVIDIOUS DIRECT-LINK (FREE, no cookies).
 
 Why v2.4.0: v2.3.0 proved Render's IP is blocked for EVERY
 server-side extraction path (all 6 yt-dlp clients + self-hosted
@@ -115,7 +125,14 @@ YTDLP_TIMEOUT_SECONDS = _get_int("YTDLP_TIMEOUT_SECONDS", 600)
 COBALT_API_URL = _get("COBALT_API_URL", "https://yttomp4-cobalt.onrender.com").strip().rstrip("/")
 COBALT_API_KEY = _get("COBALT_API_KEY", "").strip()
 COBALT_TIMEOUT_SECONDS = _get_int("COBALT_TIMEOUT_SECONDS", 60)
-VERSION = "2.4.0"
+# Slow fallbacks (yt-dlp + Cobalt) take ~90s and ALWAYS fail on Render
+# (YouTube blocks Render IPs), and the long request makes the web
+# server kill the PHP bridge with an HTML error page instead of JSON
+# (the "Unexpected token '<'" bug). Default OFF: fail fast with the
+# Invidious error so the frontend always gets clean JSON. Set to "1"
+# only on a host whose IPs YouTube does NOT block.
+ENABLE_SLOW_FALLBACKS = _get("ENABLE_SLOW_FALLBACKS", "0") == "1"
+VERSION = "2.4.1"
 
 # ---------------- Shared validation ----------------
 
@@ -447,17 +464,25 @@ def invidious_convert(url, fmt, quality, job_id, metadata):
         raise ConversionError("Invidious: could not extract video ID.")
     last_error = ""
     for base in INVIDIOUS_INSTANCES:
-        try:
-            req = urllib.request.Request(
-                f"{base}/api/v1/videos/{video_id}",
-                headers={"Accept": "application/json",
-                         "User-Agent": "YTTOMP4-Backend/2.4.0"},
-            )
-            with urllib.request.urlopen(req, timeout=INVIDIOUS_TIMEOUT_SECONDS) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-        except Exception as exc:  # noqa: BLE001 - any fetch/parse failure
-            last_error = f"{base}: {exc}"
-            logger.warning("Job %s: Invidious %s failed: %s", job_id, base, exc)
+        data = None
+        # One retry: the instance sometimes 500s transiently.
+        for attempt in (1, 2):
+            try:
+                req = urllib.request.Request(
+                    f"{base}/api/v1/videos/{video_id}",
+                    headers={"Accept": "application/json",
+                             "User-Agent": "YTTOMP4-Backend/2.4.1"},
+                )
+                with urllib.request.urlopen(req, timeout=INVIDIOUS_TIMEOUT_SECONDS) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                break
+            except Exception as exc:  # noqa: BLE001 - any fetch/parse failure
+                last_error = f"{base}: {exc}"
+                logger.warning("Job %s: Invidious %s attempt %d failed: %s",
+                               job_id, base, attempt, exc)
+                if attempt == 1:
+                    time.sleep(2)
+        if data is None:
             continue
         if isinstance(data, dict) and data.get("error"):
             last_error = f"{base}: {data.get('error')}"
@@ -558,8 +583,18 @@ def convert(url, fmt, quality, job_id):
     try:
         return invidious_convert(url, fmt, quality, job_id, metadata)
     except ConversionError as exc:
-        logger.warning("Job %s: Invidious failed, trying yt-dlp: %s", job_id, exc)
+        logger.warning("Job %s: Invidious failed: %s", job_id, exc)
         invidious_error = str(exc)
+    # Slow fallbacks are OFF by default (v2.4.1): on Render they take
+    # ~90s and always fail, and the long request gets killed into an
+    # HTML error page (the "Unexpected token '<'" bug). Fail fast
+    # instead so the frontend always gets clean JSON. Enable only on
+    # a host whose IPs YouTube does not block (ENABLE_SLOW_FALLBACKS=1).
+    if not ENABLE_SLOW_FALLBACKS:
+        raise ConversionError(
+            f"Invidious failed ({invidious_error}). "
+            "Please try again in a moment — the video service is sometimes busy."
+        )
     # Fallback 1: yt-dlp with multi-client matrix (works on unblocked hosts).
     try:
         return ytdlp_convert(url, fmt, quality, job_id, metadata)
